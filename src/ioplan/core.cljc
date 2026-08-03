@@ -133,6 +133,31 @@
 
 ;; ── order ────────────────────────────────────────────────────────────────
 
+(defn split-oversized
+  "Break any transfer larger than the device's maximum into ones it can run.
+
+  Merging refuses to GROW a command past `:max-transfer-bytes`, which is not
+  the same as ensuring none exceeds it — a single request larger than the
+  maximum arrives that way and used to pass straight through. A 1 MiB read
+  against a 128 KiB device produced one 1 MiB command, which the device cannot
+  execute, and which `benefit` correctly said should have been eight. The plan
+  was worse than its own stated floor.
+
+  Chunks are floored to whole blocks so every piece stays aligned."
+  [device requests]
+  (let [block (:block-bytes device)
+        maxt (* block (quot (:max-transfer-bytes device) block))]
+    (vec (mapcat (fn [r]
+                   (if (<= (:aligned-bytes r) maxt)
+                     [r]
+                     (mapv (fn [off]
+                             (assoc r
+                                    :aligned-offset (+ (:aligned-offset r) off)
+                                    :aligned-bytes (min maxt (- (:aligned-bytes r) off))
+                                    :split-of (:id r)))
+                           (range 0 (:aligned-bytes r) maxt))))
+                 requests))))
+
 (defn head-travel
   "Total head movement visiting these requests in this order from `start`."
   [requests start]
@@ -209,7 +234,11 @@
   (let [device (device! machine device-id)
         aligned (align device requests)
         merged (merge-adjacent device aligned (or merge-gap (default-merge-gap device)))
-        ordered (order device merged)
+        ;; After merging, because merging is what can produce a command at the
+        ;; limit; before ordering, because the pieces are separate commands the
+        ;; device visits in sequence.
+        sized (split-oversized device merged)
+        ordered (order device sized)
         batches (batch device ordered)
         requested (reduce + 0 (map :bytes requests))
         transferred (reduce + 0 (map :aligned-bytes merged))
@@ -223,8 +252,9 @@
      :order (mapv :aligned-offset ordered)
      :stats
      (cond-> {:requests-in (count requests)
-              :commands (count merged)
+              :commands (count sized)
               :merges (- (count aligned) (count merged))
+              :splits (- (count sized) (count merged))
               :batches (count batches)
               :bytes-requested requested
               :bytes-transferred transferred

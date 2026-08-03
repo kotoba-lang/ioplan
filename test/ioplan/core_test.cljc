@@ -244,3 +244,39 @@
           (is (= 100000 floor))
           (is (= (+ floor span) planned))
           (is (< 1.81 (/ (double planned) floor) 1.83)))))))
+
+;; ── a request larger than the device can transfer ────────────────────────
+
+(deftest an-oversized-request-is-split-into-commands-the-device-can-run
+  (testing "merging refuses to GROW past the maximum, which is not the same as
+            ensuring nothing exceeds it — a single 1 MiB read against a 128 KiB
+            device used to pass through whole"
+    (let [p (io/plan mach :nvme [(r :big 0 1048576)])
+          cmds (vec (apply concat (:batches p)))]
+      (is (= 8 (count cmds)))
+      (is (every? #(<= (:aligned-bytes %) 131072) cmds))
+      (is (= 1048576 (reduce + 0 (map :aligned-bytes cmds))) "no bytes lost")
+      (testing "the pieces are contiguous and block-aligned"
+        (is (= (range 0 1048576 131072) (map :aligned-offset cmds)))
+        (is (every? #(zero? (mod (:aligned-offset %) 4096)) cmds)))
+      (is (= 7 (get-in p [:stats :splits]))))))
+
+(deftest the-plan-now-meets-its-own-floor-instead-of-beating-it
+  (testing "benefit said 8 commands were the floor while plan emitted 1, which
+            is incoherent: a plan cannot be below its own lower bound"
+    (let [reqs [(r :big 0 1048576)]
+          b (io/benefit mach :nvme reqs)]
+      (is (= 8 (get-in b [:floors :commands])))
+      (is (= 8 (get-in b [:planned :commands]))))))
+
+(deftest splitting-leaves-ordinary-requests-alone
+  (let [p (io/plan mach :nvme [(r :a 0 4096) (r :b 65536 4096)])]
+    (is (zero? (get-in p [:stats :splits])))
+    (is (= 2 (get-in p [:stats :commands])))))
+
+(deftest a-seeking-device-splits-and-still-sweeps
+  (let [p (io/plan mach :disk [(r :big 0 4194304) (r :far 8388608 4096)] {:head 0})
+        cmds (vec (apply concat (:batches p)))]
+    (is (every? #(<= (:aligned-bytes %) 1048576) cmds))
+    (testing "the split pieces stay in ascending order with the rest"
+      (is (= (sort (map :aligned-offset cmds)) (map :aligned-offset cmds))))))

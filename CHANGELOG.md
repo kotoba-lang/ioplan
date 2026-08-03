@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.1 — 2026-08-03
+
+**Bug fix.** A request larger than the device's `:max-transfer-bytes` passed
+through `plan` whole. Merging refuses to *grow* a command past the maximum,
+which is not the same as ensuring none exceeds it, and a single oversized
+request arrives that way.
+
+A 1 MiB read against a 128 KiB device produced one 1 MiB command — which the
+device cannot execute, and which `benefit` correctly reported should have been
+eight. **The plan was below its own stated floor**, which is incoherent and is
+how the bug was found.
+
+`split-oversized` now runs after merging and before ordering, chunking to
+whole blocks so every piece stays aligned. `:stats :splits` reports how many
+extra commands it cost.
+
+30 tests, 97 assertions.
+
+
 ## 0.2.0 — 2026-08-03
 
 `benefit` — what can planning buy on this request list, before planning it?
