@@ -160,3 +160,87 @@
         b (io/plan mach :disk scattered)]
     (is (= (:order a) (:order b)))
     (is (= (:stats a) (:stats b)))))
+
+;; ── how much is there to win? ────────────────────────────────────────────
+
+(deftest optimal-travel-has-a-closed-form
+  (testing "outside the span you walk it once"
+    (is (= 100 (io/optimal-travel [50 100 150] 50)))
+    (is (= 100 (io/optimal-travel [50 100 150] 150))))
+  (testing "inside it you must double back over one side, so take the near one first"
+    (is (= 150 (io/optimal-travel [0 100] 50)))
+    (is (= 110 (io/optimal-travel [0 100] 10))))
+  (is (= 0 (io/optimal-travel [] 0)))
+  (is (= 0 (io/optimal-travel [42] 42))))
+
+(deftest an-already-minimal-request-list-is-not-worth-planning
+  (testing "three block-aligned, non-overlapping, non-adjacent reads on flash"
+    (let [b (io/benefit mach :nvme [(r :a 0 4096) (r :b 65536 4096) (r :c 131072 4096)])]
+      (is (= 12288 (get-in b [:floors :bytes]) (get-in b [:submitted :bytes])))
+      (is (= 3 (get-in b [:floors :commands]) (get-in b [:submitted :commands])))
+      (is (not (:worth-planning? b)))
+      (testing "and no credit is claimed for removing an excess that was zero"
+        (is (nil? (get-in b [:captured :bytes])))
+        (is (nil? (get-in b [:captured :commands])))))))
+
+(deftest contiguous-requests-have-command-excess-and-the-plan-takes-all-of-it
+  (let [b (io/benefit mach :nvme [(r :a 0 4096) (r :b 4096 4096) (r :c 8192 4096)])]
+    (testing "one union run, so one command is the floor"
+      (is (= 1 (get-in b [:floors :commands])))
+      (is (= 3 (get-in b [:submitted :commands]))))
+    (is (:worth-planning? b))
+    (testing "merging captured the whole excess"
+      (is (= 1.0 (get-in b [:captured :commands]))))
+    (testing "bytes were already minimal — merging removes overlap, not alignment"
+      (is (= 12288 (get-in b [:floors :bytes])))
+      (is (nil? (get-in b [:captured :bytes]))))))
+
+(deftest overlapping-requests-are-where-bytes-can-be-removed
+  (testing "two reads covering the same block twice"
+    (let [b (io/benefit mach :nvme [(r :a 0 4096) (r :b 2048 2048)])]
+      (is (= 4096 (get-in b [:floors :bytes])))
+      (is (= 8192 (get-in b [:submitted :bytes])))
+      (is (:worth-planning? b))
+      (is (= 1.0 (get-in b [:captured :bytes]))))))
+
+(deftest travel-is-nil-on-a-device-that-charges-nothing-to-seek
+  (testing "not zero — the quantity does not apply rather than being minimal"
+    (let [b (io/benefit mach :nvme scattered)]
+      (is (nil? (get-in b [:floors :travel])))
+      (is (nil? (get-in b [:captured :travel]))))))
+
+(deftest the-elevator-captures-all-of-the-travel-excess-on-a-disk
+  (let [b (io/benefit mach :disk scattered {:head 0})]
+    (testing "the head starts below the span, so one ascending sweep is optimal"
+      (is (= 81920 (get-in b [:floors :travel])))
+      (is (= 81920 (get-in b [:planned :travel]))))
+    (is (< (get-in b [:floors :travel]) (get-in b [:submitted :travel])))
+    (is (= 1.0 (get-in b [:captured :travel])))
+    (is (:worth-planning? b))))
+
+(deftest a-mid-span-head-still-lets-c-scan-be-optimal
+  (testing "doubling back over the lower half is what the optimum does too"
+    (let [b (io/benefit mach :disk scattered {:head 40960})]
+      (is (= 122880 (get-in b [:floors :travel])))
+      (is (= 1.0 (get-in b [:captured :travel]))))))
+
+(deftest c-scan-from-above-the-span-costs-the-span-twice-over
+  (testing "the ascending sweep walks DOWN to the lowest request and then back
+            up over the same ground, while the shortest walk just descends. So
+            C-SCAN pays (head - lo) + span against an optimum of (head - lo):
+            the ratio is 1 + span/(head - lo), which is exactly 2 when the head
+            sits on the top of the span and decays toward 1 as it moves away.
+            This is the price of the anti-starvation choice `order` documents,
+            and `benefit` is what turns it from prose into a number."
+    (let [span 81920]
+      (testing "head exactly on the top of the span: the worst case, exactly 2x"
+        (let [b (io/benefit mach :disk scattered {:head 81920})]
+          (is (= 81920 (get-in b [:floors :travel])))
+          (is (= 163840 (get-in b [:planned :travel])))))
+      (testing "further above, the penalty decays as 1 + span/(head - lo)"
+        (let [b (io/benefit mach :disk scattered {:head 100000})
+              floor (get-in b [:floors :travel])
+              planned (get-in b [:planned :travel])]
+          (is (= 100000 floor))
+          (is (= (+ floor span) planned))
+          (is (< 1.81 (/ (double planned) floor) 1.83)))))))

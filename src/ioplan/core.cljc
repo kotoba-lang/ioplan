@@ -150,6 +150,15 @@
   is walking away from, and the starved request is usually the interactive
   one.
 
+  That fairness is not free, and `benefit` prices it. From a head above the
+  span, C-SCAN walks down to the lowest request and then sweeps back up over
+  the same ground, paying `(head - lo) + span` against an optimum of
+  `(head - lo)` — a ratio of `1 + span/(head - lo)`, which is **exactly 2 when
+  the head sits on the top of the span** and decays toward 1 as it moves
+  further away. From a head below or inside the span it is optimal. Trading up
+  to 2x travel for bounded latency at the far end is a defensible choice;
+  making it without knowing the factor is not.
+
   `:low` — sorted, but no sweep discipline. There is a cost to locality but
   no head to walk.
 
@@ -262,3 +271,106 @@
        (str "reordered: head travel " (:head-travel stats) "B against "
             (:head-travel-submitted stats) "B as submitted")
        "not reordered: this device charges nothing for seeking, so submission order stands")]))
+
+;; ── how much is there to win? ────────────────────────────────────────────
+;;
+;; The other three T5 libraries each gained a bound you can compute before
+;; running anything: `layout/achievable-ratio`, `traversal/tiling-benefit`,
+;; `paging/headroom`. This is that bound for I/O planning, and it exists for
+;; the same reason — merging and ordering are only worth doing when there is
+;; something for them to remove, and whether there is depends on the request
+;; list rather than on the planner.
+;;
+;; Both floors are exact rather than estimated, which is unusual and worth
+;; saying: the byte floor is the measure of the union of the aligned ranges,
+;; and no plan moves fewer bytes than the bytes it was asked for. The travel
+;; floor is the classic shortest walk visiting every point on a line from a
+;; starting position, which has a closed form.
+
+(defn- union-runs
+  "Maximal non-overlapping runs covering every aligned request. Adjacent runs
+  are fused, because a device does not charge extra to cross the join."
+  [aligned]
+  (->> (sort-by :aligned-offset aligned)
+       (reduce (fn [runs r]
+                 (let [start (:aligned-offset r)
+                       end (+ start (:aligned-bytes r))
+                       prev (peek runs)]
+                   (if (and prev (<= start (:end prev)))
+                     (conj (pop runs) (assoc prev :end (max (:end prev) end)))
+                     (conj runs {:start start :end end}))))
+               [])))
+
+(defn optimal-travel
+  "Shortest head movement that visits every point, starting from `head`.
+
+  Closed form, not a heuristic. Outside the span you walk it once. Inside it,
+  you must double back over one side, so the cheaper choice is to cover the
+  nearer side first and the further side last."
+  [points head]
+  (if (empty? points)
+    0
+    (let [lo (apply min points) hi (apply max points)]
+      (cond
+        (<= head lo) (- hi head)
+        (>= head hi) (- head lo)
+        :else (min (+ (* 2 (- head lo)) (- hi head))
+                   (+ (* 2 (- hi head)) (- head lo)))))))
+
+(defn benefit
+  "What planning can buy on this request list, before planning it.
+
+  Three comparisons, each against a floor no planner can beat:
+
+  - **bytes** — the union of the aligned ranges. Overlapping requests are the
+    only thing merging removes here; alignment overhead is not removable at
+    all, so a plan already at this floor cannot be improved by merging.
+  - **commands** — one per union run, split at the device's maximum transfer.
+  - **travel** — `optimal-travel`, and only for a device that charges for
+    seeking. On a zero-seek device this is `nil` rather than zero, because the
+    quantity does not apply rather than being minimal.
+
+  `:worth-planning?` is the summary: is the unplanned submission meaningfully
+  worse than the floor? When it is false, `plan` will return something correct
+  and pointless, and the honest report is that the request list was already
+  good."
+  [machine device-id requests & [{:keys [head] :or {head 0}}]]
+  (check! requests)
+  (let [device (device! machine device-id)
+        aligned (align device requests)
+        runs (union-runs aligned)
+        floor-bytes (reduce + 0 (map #(- (:end %) (:start %)) runs))
+        maxt (:max-transfer-bytes device)
+        floor-commands (reduce + 0 (map #(max 1 (quot (+ (- (:end %) (:start %)) (dec maxt)) maxt))
+                                        runs))
+        submitted-bytes (reduce + 0 (map :aligned-bytes aligned))
+        offsets (mapv :aligned-offset aligned)
+        seeking? (m/reorderable? device)
+        floor-travel (when seeking? (optimal-travel (mapv :start runs) head))
+        submitted-travel (when seeking? (head-travel aligned head))
+        p (plan machine device-id requests {:head head})
+        planned (:stats p)]
+    {:format format-id
+     :device (:id device)
+     :floors {:bytes floor-bytes :commands floor-commands :travel floor-travel}
+     :submitted {:bytes submitted-bytes :commands (count aligned) :travel submitted-travel}
+     :planned {:bytes (:bytes-transferred planned)
+               :commands (:commands planned)
+               :travel (:head-travel planned)}
+     ;; Fraction of the removable excess the plan actually removed. `nil` when
+     ;; there was no excess to remove — reporting 1.0 there would claim credit
+     ;; for a request list that was already minimal.
+     :captured
+     {:bytes (when (> submitted-bytes floor-bytes)
+               (double (/ (- submitted-bytes (:bytes-transferred planned))
+                          (- submitted-bytes floor-bytes))))
+      :commands (when (> (count aligned) floor-commands)
+                  (double (/ (- (count aligned) (:commands planned))
+                             (- (count aligned) floor-commands))))
+      :travel (when (and seeking? (> submitted-travel floor-travel))
+                (double (/ (- submitted-travel (:head-travel planned))
+                           (- submitted-travel floor-travel))))}
+     :worth-planning? (boolean (or (> submitted-bytes floor-bytes)
+                                   (> (count aligned) floor-commands)
+                                   (and seeking? (> submitted-travel floor-travel))))
+     :machine (:machine/id machine)}))
