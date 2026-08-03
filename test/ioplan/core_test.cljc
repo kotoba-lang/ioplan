@@ -379,3 +379,31 @@
       (testing "and pays for it in bytes, which is the trade the floor cannot see"
         (is (> (get-in bridged [:stats :bytes-transferred])
                (get-in b [:floors :bytes])))))))
+
+(deftest captured-never-exceeds-what-was-removable
+  (testing "a fraction of the removable excess cannot exceed 1.0. On the real
+            packfile layout this reported 1.05 for commands -- a plan credited
+            with removing 105% of what could be removed -- because :planned
+            was measured with gap bridging on and the floors bound a planner
+            without it. Both sides now describe the same lever"
+    (doseq [dev [:nvme :ssd :disk]]
+      (let [b (io/benefit mach dev (fetch-order))]
+        (is (= :merging-and-ordering (:bounds b)))
+        (is (= :disabled-for-this-comparison (:gap-bridging b)))
+        (doseq [k [:bytes :commands :travel]]
+          (when-let [v (get-in b [:captured k])]
+            (is (<= 0.0 v 1.0)
+                (str dev " captured " (name k) " = " v))))))))
+
+(deftest benefit-reports-the-plan-you-get-by-asking-for-that-lever
+  (testing ":planned here is deliberately not the default plan. Anyone
+            reproducing it needs merge-gap 0, and if that ever drifts the two
+            halves of the comparison stop describing the same thing again"
+    (doseq [dev [:nvme :ssd :disk]]
+      (let [b (io/benefit mach dev (fetch-order))
+            strict (io/plan mach dev (fetch-order) {:merge-gap 0})]
+        (is (= (:planned b)
+               {:bytes (get-in strict [:stats :bytes-transferred])
+                :commands (get-in strict [:stats :commands])
+                :travel (get-in strict [:stats :head-travel])})
+            (str dev))))))

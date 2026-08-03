@@ -363,7 +363,23 @@
   `:worth-planning?` is the summary: is the unplanned submission meaningfully
   worse than the floor? When it is false, `plan` will return something correct
   and pointless, and the honest report is that the request list was already
-  good."
+  good.
+
+  **These floors bound MERGING AND ORDERING, not gap bridging, and the
+  `:planned` figures here are measured with bridging switched off so the two
+  sides describe the same lever.** `plan` bridges gaps smaller than a seek by
+  default: it buys a command by transferring bytes nobody asked for, which a
+  union-of-ranges floor cannot see and does not bound. Measured on a real
+  packfile layout, the default plan issued 73 commands against a floor of 82
+  and `:captured :commands` came out at **1.05** — a plan reported as removing
+  105% of the removable excess. The floor was not wrong; the comparison was,
+  in the same way that running a prefetching cache against a demand-paging
+  bound makes LRU beat Belady.
+
+  So `:planned` here is deliberately NOT what `plan` returns by default. To
+  reproduce it, pass `{:merge-gap 0}`. To see what bridging buys, compare that
+  against the default plan — it is a separate lever with a separate ceiling
+  and it belongs in a separate comparison."
   [machine device-id requests & [{:keys [head] :or {head 0}}]]
   (check! requests)
   (let [device (device! machine device-id)
@@ -378,10 +394,17 @@
         seeking? (m/reorderable? device)
         floor-travel (when seeking? (optimal-travel (mapv :start runs) head))
         submitted-travel (when seeking? (head-travel aligned head))
-        p (plan machine device-id requests {:head head})
+        ;; merge-gap 0: the floors below bound merging and ordering. Letting
+        ;; the internal plan bridge gaps measures a different lever against
+        ;; them and produced :captured :commands of 1.05 on real offsets.
+        p (plan machine device-id requests {:head head :merge-gap 0})
         planned (:stats p)]
     {:format format-id
      :device (:id device)
+     ;; Which lever these floors bound, stated rather than assumed. A caller
+     ;; comparing them against a default `plan` is comparing two levers.
+     :bounds :merging-and-ordering
+     :gap-bridging :disabled-for-this-comparison
      :floors {:bytes floor-bytes :commands floor-commands :travel floor-travel}
      :submitted {:bytes submitted-bytes :commands (count aligned) :travel submitted-travel}
      :planned {:bytes (:bytes-transferred planned)
