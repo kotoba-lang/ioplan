@@ -5,7 +5,7 @@
         {:git/url "https://github.com/kotoba-lang/machine.git"
          :git/sha "5e99d3ecde7489ae64755d3a4abb193f4a3cb2f6"}}
  :aliases
- {:test {:extra-paths ["test"]
+ {:test {:extra-paths ["test" "test/resources"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
          :main-opts ["-m" "cognitect.test-runner"]

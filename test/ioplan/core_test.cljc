@@ -280,3 +280,102 @@
     (is (every? #(<= (:aligned-bytes %) 1048576) cmds))
     (testing "the split pieces stay in ascending order with the rest"
       (is (= (sort (map :aligned-offset cmds)) (map :aligned-offset cmds))))))
+
+;; ── a real layout, a computed order ──────────────────────────────────────
+;;
+;; Every other test here uses offsets chosen to exercise a branch. These use
+;; the real byte layout of 256 objects in a git packfile from this workspace
+;; -- what a planner is actually handed when asked to fetch a set of objects.
+;;
+;; The layout is real and checked in; the ORDER requests arrive in is computed
+;; here, because that is the variable a planner exists to change. Nothing is
+;; timed, so this says the same thing on a loaded machine as on an idle one.
+
+(def ^:private layout
+  (-> "packfile-layout.edn" clojure.java.io/resource slurp read-string))
+
+(defn- fetch-order
+  "Objects in id order, which is uncorrelated with offset -- the pattern you
+  get asking for a set of objects by name rather than by position."
+  []
+  (->> layout
+       (sort-by :id)
+       (mapv (fn [o] {:id (:id o) :op :read :offset (:offset o) :bytes (:bytes o)}))))
+
+(deftest the-real-layout-is-a-valid-request-list
+  (is (= 256 (count layout)))
+  (is (empty? (io/request-errors (fetch-order))))
+  (testing "and it spans the pack rather than one hot region, or the ordering
+            question this is here to ask would be trivial"
+    (let [offs (map :offset layout)]
+      (is (< 4000000 (- (apply max offs) (apply min offs)))))))
+
+(deftest every-floor-holds-on-real-offsets
+  (testing "a plan can equal a floor but never beat one. These are the bounds
+            the whole namespace is judged against, and until now none of them
+            had been checked against a layout somebody did not invent"
+    (doseq [dev [:nvme :ssd :disk]]
+      (let [reqs (fetch-order)
+            b (io/benefit mach dev reqs)
+            ;; merge-gap 0: the floors below bound a planner that does not
+            ;; bridge gaps, and `plan` bridges by default. Comparing the two
+            ;; is the same category error as running a prefetching cache
+            ;; against Belady -- see the test just after this one.
+            p (io/plan mach dev reqs {:merge-gap 0})]
+        (is (<= (get-in b [:floors :bytes]) (get-in p [:stats :bytes-transferred]))
+            (str dev " moved fewer bytes than the union of aligned ranges"))
+        (is (<= (get-in b [:floors :commands]) (get-in p [:stats :commands]))
+            (str dev " issued fewer commands than the union runs allow"))
+        (when-let [floor-travel (get-in b [:floors :travel])]
+          (is (<= floor-travel (get-in p [:stats :head-travel]))
+              (str dev " travelled less than the optimal tour")))))))
+
+(deftest ordering-buys-something-real-on-a-seeking-device
+  (testing "requests arriving in id order are scattered across the pack.
+            Sorting them is the entire point of `order`, and on real offsets
+            it should collapse travel by a wide margin"
+    (let [reqs (fetch-order)
+          submitted (get-in (io/plan mach :disk reqs) [:stats :head-travel-submitted])
+          planned (get-in (io/plan mach :disk reqs) [:stats :head-travel])]
+      (is (< (* 10 planned) submitted)
+          (str "planned travel " planned " against submitted " submitted)))))
+
+(deftest a-zero-seek-device-reports-travel-as-absent-not-zero
+  (testing "on nvme the quantity does not apply. Reporting 0 would read as
+            'already optimal' and invite a planner to sort for nothing"
+    (is (nil? (get-in (io/benefit mach :nvme (fetch-order)) [:floors :travel])))
+    (is (some? (get-in (io/benefit mach :disk (fetch-order)) [:floors :travel])))))
+
+(deftest no-command-exceeds-what-the-device-accepts
+  (testing "merging refuses to GROW a command past the maximum, which is not
+            the same as guaranteeing none exceeds it -- a 1 MiB command was
+            once emitted against a 128 KiB device because those two were
+            confused. Real offsets with real sizes are a fair test of that"
+    (doseq [dev [:nvme :ssd :disk]]
+      (let [maxt (:max-transfer-bytes (first (filter #(= dev (:id %)) (:storage mach))))
+            p (io/plan mach dev (fetch-order))]
+        (is (<= (get-in p [:stats :bytes-transferred])
+                (* maxt (get-in p [:stats :commands])))
+            (str dev ": total bytes exceed what its command count can carry, so
+                 at least one command is over the device maximum"))))))
+
+(deftest the-command-floor-bounds-a-planner-that-does-not-bridge-gaps
+  (testing "on real offsets the default plan issues FEWER commands than
+            benefit's floor -- 73 against 82 -- which looks like a broken
+            bound and is not. Bridging a gap smaller than a seek buys a
+            command by transferring bytes nobody asked for, and the floor
+            bounds a planner that never does it. Same shape as running a
+            prefetching cache against a demand-paging bound: the bound was
+            fine, the comparison was not"
+    (let [reqs (fetch-order)
+          b (io/benefit mach :disk reqs)
+          bridged (io/plan mach :disk reqs)
+          strict (io/plan mach :disk reqs {:merge-gap 0})]
+      (testing "with bridging off, the plan lands exactly on both floors"
+        (is (= (get-in b [:floors :commands]) (get-in strict [:stats :commands])))
+        (is (= (get-in b [:floors :bytes]) (get-in strict [:stats :bytes-transferred]))))
+      (testing "with bridging on, it goes below the command floor"
+        (is (< (get-in bridged [:stats :commands]) (get-in b [:floors :commands]))))
+      (testing "and pays for it in bytes, which is the trade the floor cannot see"
+        (is (> (get-in bridged [:stats :bytes-transferred])
+               (get-in b [:floors :bytes])))))))
