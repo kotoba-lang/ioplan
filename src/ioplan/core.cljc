@@ -347,6 +347,57 @@
         :else (min (+ (* 2 (- head lo)) (- hi head))
                    (+ (* 2 (- hi head)) (- head lo)))))))
 
+(defn bridging-floor
+  "Fewest commands achievable while transferring `extra-bytes` beyond the byte
+  floor, by bridging gaps.
+
+  `benefit`'s floors bound merging and ordering and deliberately say nothing
+  about this lever -- `plan` bridges gaps smaller than a seek by default,
+  buying a command with bytes nobody asked for, and measured against a
+  union-of-ranges floor that looks like beating the bound. Calling it a
+  separate lever with a separate ceiling, and then not providing the ceiling,
+  leaves the comparison exactly as unanswerable as before. So here it is.
+
+  The accounting is exact rather than heuristic. Bridging one gap fuses two
+  runs, and
+
+      ceil((a + g + b) / m) >= ceil(a/m) + ceil(b/m) - 1
+
+  so a bridged gap saves AT MOST one command, whatever the sizes. The best any
+  planner can do with a byte budget is therefore to spend it on the cheapest
+  gaps: sort ascending, take the longest prefix that fits, and subtract that
+  count from the merge-and-order floor. No planner beats it, and unlike a
+  greedy plan this is a bound rather than a strategy.
+
+  Returns `nil` for a device that does not reward bridging -- on zero-seek
+  hardware the default gap is already 0, and a budget spent there buys
+  nothing rather than buying a little."
+  [machine device-id requests {:keys [extra-bytes] :or {extra-bytes 0}}]
+  (check! requests)
+  (let [device (device! machine device-id)]
+    (when (m/reorderable? device)
+      (let [aligned (align device requests)
+            runs (union-runs aligned)
+            maxt (:max-transfer-bytes device)
+            ceil-div (fn [n d] (quot (+ n (dec d)) d))
+            base (reduce + 0 (map #(max 1 (ceil-div (- (:end %) (:start %)) maxt)) runs))
+            gaps (sort (map (fn [[a b]] (- (:start b) (:end a))) (partition 2 1 runs)))
+            afford (loop [gs gaps spent 0 n 0]
+                     (if (and (seq gs) (<= (+ spent (first gs)) extra-bytes))
+                       (recur (next gs) (+ spent (first gs)) (inc n))
+                       {:bridged n :bytes-spent spent}))]
+        {:format format-id
+         :device (:id device)
+         :bounds :gap-bridging
+         :extra-bytes-allowed extra-bytes
+         :commands-without-bridging base
+         :gaps-available (count gaps)
+         :gaps-bridged (:bridged afford)
+         :bytes-spent (:bytes-spent afford)
+         :commands-floor (- base (:bridged afford))
+         :note "one bridged gap saves at most one command, so this is a floor
+                no planner beats -- not a plan to imitate"}))))
+
 (defn benefit
   "What planning can buy on this request list, before planning it.
 

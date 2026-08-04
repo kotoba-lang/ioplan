@@ -407,3 +407,47 @@
                 :commands (get-in strict [:stats :commands])
                 :travel (get-in strict [:stats :head-travel])})
             (str dev))))))
+
+(deftest the-bridging-lever-now-has-the-ceiling-it-was-promised
+  (testing "benefit's floors bound merging and ordering and say so. The other
+            lever was described as having a separate ceiling and did not have
+            one, which left `plan` issuing 73 commands against a floor of 82
+            with no way to tell whether that was good"
+    (doseq [dev [:disk :ssd]]
+      (let [reqs (fetch-order)
+            b (io/benefit mach dev reqs)
+            p (io/plan mach dev reqs)
+            spent (- (get-in p [:stats :bytes-transferred]) (get-in b [:floors :bytes]))
+            f (io/bridging-floor mach dev reqs {:extra-bytes spent})]
+        (is (= :gap-bridging (:bounds f)))
+        (testing "the plan cannot beat the floor for the bytes it actually spent"
+          (is (<= (:commands-floor f) (get-in p [:stats :commands])) (str dev)))
+        (testing "and on this trace it exactly meets it -- 36864 extra bytes buy
+                  9 bridged gaps and 9 commands, which is all they can buy"
+          (is (= (:commands-floor f) (get-in p [:stats :commands])) (str dev)))))))
+
+(deftest spending-nothing-bridges-nothing
+  (testing "the budget is the whole lever: with no bytes to spend the floor
+            falls back to the merge-and-order figure"
+    (let [reqs (fetch-order)
+          b (io/benefit mach :disk reqs)
+          f (io/bridging-floor mach :disk reqs {:extra-bytes 0})]
+      (is (zero? (:gaps-bridged f)))
+      (is (= (get-in b [:floors :commands]) (:commands-floor f))))))
+
+(deftest more-budget-never-raises-the-floor
+  (testing "monotone in the budget, which a greedy-over-sorted-gaps bound must
+            be, and a broken one would not"
+    (let [reqs (fetch-order)
+          floors (map #(:commands-floor (io/bridging-floor mach :disk reqs {:extra-bytes %}))
+                      [0 10000 36864 100000 10000000])]
+      (is (apply >= floors) (pr-str floors))
+      (testing "and enough budget bridges every gap there is"
+        (let [f (io/bridging-floor mach :disk reqs {:extra-bytes 10000000})]
+          (is (= (:gaps-available f) (:gaps-bridged f))))))))
+
+(deftest a-zero-seek-device-has-no-bridging-lever-at-all
+  (testing "nil rather than a floor equal to the base: on nvme the default gap
+            is already 0, so a byte budget spent there buys nothing rather than
+            buying a little, and reporting a number would invite spending it"
+    (is (nil? (io/bridging-floor mach :nvme (fetch-order) {:extra-bytes 100000})))))
