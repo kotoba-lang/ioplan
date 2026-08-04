@@ -3,7 +3,7 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         io.github.kotoba-lang/machine
         {:git/url "https://github.com/kotoba-lang/machine.git"
-         :git/sha "5e99d3ecde7489ae64755d3a4abb193f4a3cb2f6"}}
+         :git/sha "e7235657c6f6bc4e43e7e6126c1c0912e8dbf5f4"}}
  :aliases
  {:test {:extra-paths ["test" "test/resources"]
          :extra-deps {io.github.cognitect-labs/test-runner
