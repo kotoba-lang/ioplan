@@ -84,7 +84,7 @@ planner **declined** to do.
 ## Test
 
 ```sh
-clojure -M:test
+kbb -M:test
 ```
 
 Pure `.cljc`. Depends only on
