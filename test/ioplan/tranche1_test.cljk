@@ -1,5 +1,5 @@
 (ns ioplan.tranche1-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [kotoba.test :refer [deftest is]]
             [machine.core :as m]
             [ioplan.core :as io]
             [clojure.edn :as edn]))
