@@ -2,7 +2,7 @@
   (:require [kotoba.test :refer [deftest is]]
             [machine.core :as m]
             [ioplan.core :as io]
-            [clojure.edn :as edn]))
+            [kotoba.lang.edn :as edn]))
 
 (def specs (edn/read-string (slurp "/var/folders/h_/bx1m0lv90qxb1sdrx5tqn8b80000gn/T/os-stack-hardware-tranche1-clean.edn")))
 (def by-id (into {} (map (juxt :machine/id :descriptor) specs)))
